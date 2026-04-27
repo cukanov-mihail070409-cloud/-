@@ -1,0 +1,112 @@
+import asyncio
+import cv2
+import numpy as np
+from PIL import Image
+import mediapipe as mp
+import io
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+
+# ---------------- CONFIG ----------------
+TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# ---------------- MEDIA PIPE ----------------
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(static_image_mode=True)
+
+# ---------------- UTIL ----------------
+def get_keypoints(image):
+    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = pose.process(img_rgb)
+
+    if not results.pose_landmarks:
+        return None
+
+    h, w, _ = image.shape
+
+    landmarks = results.pose_landmarks.landmark
+
+    return {
+        "right_wrist": (
+            int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST].x * w),
+            int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST].y * h)
+        ),
+        "left_wrist": (
+            int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST].x * w),
+            int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST].y * h)
+        ),
+        "mouth": (
+            int(landmarks[mp_pose.PoseLandmark.MOUTH_LEFT].x * w),
+            int(landmarks[mp_pose.PoseLandmark.MOUTH_LEFT].y * h)
+        )
+    }
+
+
+def overlay_object(image, obj_path, position, size=80):
+    obj = Image.open(obj_path).convert("RGBA")
+    obj = obj.resize((size, size))
+
+    img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+    x, y = position
+    img.paste(obj, (x, y), obj)
+
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+# ---------------- BOT ----------------
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    await message.answer(
+        "🤖 AR Bot готов!\n\n"
+        "Отправь фото человека — я добавлю AR объекты 🍦🎤"
+    )
+
+
+@dp.message(F.photo)
+async def process_photo(message: types.Message):
+    file = await bot.get_file(message.photo[-1].file_id)
+    data = await bot.download_file(file.file_path)
+
+    img_array = np.frombuffer(data.read(), np.uint8)
+    image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+
+    keypoints = get_keypoints(image)
+
+    if not keypoints:
+        await message.answer("❌ Человек не найден на фото")
+        return
+
+    # 🍦 добавляем мороженое в правую руку
+    image = overlay_object(
+        image,
+        "icecream.png",
+        keypoints["right_wrist"],
+        size=70
+    )
+
+    # 🎤 добавляем микрофон ко рту
+    image = overlay_object(
+        image,
+        "mic.png",
+        keypoints["mouth"],
+        size=60
+    )
+
+    # отправка результата
+    _, buffer = cv2.imencode(".jpg", image)
+    bio = io.BytesIO(buffer)
+
+    await message.answer_photo(bio, caption="🍦 AR overlay applied!")
+
+
+# ---------------- RUN ----------------
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())# -

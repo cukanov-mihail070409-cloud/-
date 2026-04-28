@@ -1,112 +1,286 @@
 import asyncio
+import time
+import uuid
 import cv2
 import numpy as np
-from PIL import Image
-import mediapipe as mp
-import io
+import base64
+import hashlib
+import httpx
+import json
+import redis
 
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import BufferedInputFile
 from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
 
-# ---------------- CONFIG ----------------
-TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+
+# ===================== CONFIG =====================
+
+TOKEN = "YOUR_TOKEN"
+OPENAI_KEY = "YOUR_KEY"
 
 bot = Bot(token=TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
-# ---------------- MEDIA PIPE ----------------
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=True)
-
-# ---------------- UTIL ----------------
-def get_keypoints(image):
-    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = pose.process(img_rgb)
-
-    if not results.pose_landmarks:
-        return None
-
-    h, w, _ = image.shape
-
-    landmarks = results.pose_landmarks.landmark
-
-    return {
-        "right_wrist": (
-            int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST].x * w),
-            int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST].y * h)
-        ),
-        "left_wrist": (
-            int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST].x * w),
-            int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST].y * h)
-        ),
-        "mouth": (
-            int(landmarks[mp_pose.PoseLandmark.MOUTH_LEFT].x * w),
-            int(landmarks[mp_pose.PoseLandmark.MOUTH_LEFT].y * h)
-        )
-    }
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
 
-def overlay_object(image, obj_path, position, size=80):
-    obj = Image.open(obj_path).convert("RGBA")
-    obj = obj.resize((size, size))
+# ===================== PRIVACY =====================
 
-    img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-
-    x, y = position
-    img.paste(obj, (x, y), obj)
-
-    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+def anon(uid: int):
+    return hashlib.sha256(str(uid).encode()).hexdigest()[:12]
 
 
-# ---------------- BOT ----------------
-@dp.message(Command("start"))
-async def start(message: types.Message):
-    await message.answer(
-        "🤖 AR Bot готов!\n\n"
-        "Отправь фото человека — я добавлю AR объекты 🍦🎤"
-    )
+# ===================== JOB SYSTEM (REDIS SaaS CORE) =====================
+
+def create_job(data: dict):
+    job_id = str(uuid.uuid4())
+    job = {
+        "id": job_id,
+        "status": "pending",
+        "data": json.dumps(data),
+        "created": time.time(),
+        "retries": 0
+    }
+    r.lpush("jobs", json.dumps(job))
+    return job_id
 
 
-@dp.message(F.photo)
-async def process_photo(message: types.Message):
-    file = await bot.get_file(message.photo[-1].file_id)
-    data = await bot.download_file(file.file_path)
-
-    img_array = np.frombuffer(data.read(), np.uint8)
-    image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-    keypoints = get_keypoints(image)
-
-    if not keypoints:
-        await message.answer("❌ Человек не найден на фото")
-        return
-
-    # 🍦 добавляем мороженое в правую руку
-    image = overlay_object(
-        image,
-        "icecream.png",
-        keypoints["right_wrist"],
-        size=70
-    )
-
-    # 🎤 добавляем микрофон ко рту
-    image = overlay_object(
-        image,
-        "mic.png",
-        keypoints["mouth"],
-        size=60
-    )
-
-    # отправка результата
-    _, buffer = cv2.imencode(".jpg", image)
-    bio = io.BytesIO(buffer)
-
-    await message.answer_photo(bio, caption="🍦 AR overlay applied!")
+def update_job(job):
+    r.set(f"job:{job['id']}", json.dumps(job))
 
 
-# ---------------- RUN ----------------
+def get_job(job_id):
+    data = r.get(f"job:{job_id}")
+    return json.loads(data) if data else None
+
+
+# ===================== CPU POOL =====================
+
+async def run_cpu(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, func, *args)
+
+
+# ===================== IMAGE CORE =====================
+
+def decode(img_bytes):
+    arr = np.frombuffer(img_bytes, np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+# ===================== AI ENGINE =====================
+
+async def ai_generate(prompt):
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post(
+            "https://api.openai.com/v1/images/generations",
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+            json={
+                "model": "gpt-image-1",
+                "prompt": prompt,
+                "size": "1024x1024"
+            }
+        )
+        return base64.b64decode(r.json()["data"][0]["b64_json"])
+
+
+async def ai_edit(img, prompt):
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post(
+            "https://api.openai.com/v1/images/edits",
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+            files={"image": ("img.png", img, "image/png")},
+            data={"prompt": prompt, "model": "gpt-image-1"}
+        )
+        return base64.b64decode(r.json()["data"][0]["b64_json"])
+
+
+# ===================== FACE SWAP (HOOK READY) =====================
+
+def faceswap(source, target):
+    # INSIGHTFACE hook (production version plug here)
+    return target
+
+
+# ===================== AR ENGINE =====================
+
+def ar_process(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+# ===================== PLUGINS v2 =====================
+
+class Plugin:
+    async def run(self, ctx):
+        pass
+
+
+class GenPlugin(Plugin):
+    async def run(self, ctx):
+        img = await ai_generate(ctx["prompt"])
+        return {"type": "image", "data": img}
+
+
+class EditPlugin(Plugin):
+    async def run(self, ctx):
+        img = await ai_edit(ctx["image"], ctx["prompt"])
+        return {"type": "image", "data": img}
+
+
+class ARPlugin(Plugin):
+    async def run(self, ctx):
+        img = await run_cpu(ar_process, ctx["image"])
+        _, buf = cv2.imencode(".jpg", img)
+        return {"type": "image", "data": buf.tobytes()}
+
+
+class FaceSwapPlugin(Plugin):
+    async def run(self, ctx):
+        img = faceswap(ctx["source"], ctx["target"])
+        return {"type": "image", "data": img}
+
+
+plugins = {
+    "gen": GenPlugin(),
+    "edit": EditPlugin(),
+    "ar": ARPlugin(),
+    "faceswap": FaceSwapPlugin()
+}
+
+
+# ===================== ROUTER v2 =====================
+
+def route(text):
+    t = text.lower()
+
+    if "/gen" in t:
+        return "gen"
+    if "/edit" in t:
+        return "edit"
+    if "swap" in t:
+        return "faceswap"
+    if "ar" in t:
+        return "ar"
+
+    return "unknown"
+
+
+# ===================== WORKER SYSTEM =====================
+
+async def worker():
+    while True:
+
+        job_raw = r.rpop("jobs")
+        if not job_raw:
+            await asyncio.sleep(0.2)
+            continue
+
+        job = json.loads(job_raw)
+        data = json.loads(job["data"])
+
+        try:
+            job["status"] = "running"
+            update_job(job)
+
+            plugin = plugins.get(data["type"])
+            if not plugin:
+                continue
+
+            result = await plugin.run(data)
+
+            job["status"] = "done"
+            job["result"] = base64.b64encode(result["data"]).decode()
+
+            update_job(job)
+
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+            job["retries"] += 1
+            update_job(job)
+
+
+# ===================== START WORKERS =====================
+
+async def start_workers():
+    for _ in range(4):
+        asyncio.create_task(worker())
+
+
+# ===================== FILE =====================
+
+async def load(file_id):
+    f = await bot.get_file(file_id)
+    d = await bot.download_file(f.file_path)
+    return d.read()
+
+
+# ===================== HANDLER =====================
+
+@dp.message(F.photo | F.text)
+async def handler(message: types.Message):
+
+    uid = message.from_user.id
+
+    if message.photo:
+
+        raw = await load(message.photo[-1].file_id)
+
+        job_id = create_job({
+            "type": "ar",
+            "image": base64.b64encode(raw).decode()
+        })
+
+        await message.answer(f"⚙️ job created: {job_id}")
+        return
+
+
+    if message.text:
+
+        intent = route(message.text)
+
+        if intent == "gen":
+
+            prompt = message.text.replace("/gen", "")
+
+            job_id = create_job({
+                "type": "gen",
+                "prompt": prompt
+            })
+
+            await message.answer(f"🎨 generating job: {job_id}")
+
+        elif intent == "edit":
+            await message.answer("📸 send image + /edit prompt")
+
+        elif intent == "faceswap":
+            await message.answer("👤 send 2 images")
+
+        else:
+            await message.answer("🤖 unknown command")
+
+
+# ===================== JOB RESULT POLLER =====================
+
+async def job_poller():
+    while True:
+        await asyncio.sleep(2)
+
+
+# ===================== MAIN =====================
+
 async def main():
-    await dp.start_polling(bot)
+    print("Bot started")
+
+    await start_workers()
+
+    asyncio.create_task(job_poller())
+
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())# -
+    asyncio.run(main())
